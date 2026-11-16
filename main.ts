@@ -14,10 +14,11 @@
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
-// Authored revision: registry poll state surfaced on stderr for diagnosability (attempt counter log).
+// main.ts imports only its own server (app.ts) plus a type from node:http: no package, no model call.
+// Authored revision: typed retry clock, deadline-aware shutdown, structured stderr diagnostics.
 
 import { createApp } from './app.ts';
+import type { Server } from 'node:http';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -30,12 +31,19 @@ const REQUEST_TIMEOUT_MS = 30_000;
 /** The first wait between retries, and the longest. */
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
+/** After a successful shutdown, exit 0 — but never hang past this in close(). */
+const CLOSE_GRACE_MS = 5_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+}
+
+/** One stderr line, prefixed so trial logs stay greppable. */
+function note(message: string): void {
+  process.stderr.write(`[entry] ${message}\n`);
 }
 
 /**
@@ -52,32 +60,59 @@ async function register(port: number): Promise<void> {
         body: JSON.stringify({ port }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (res.status === 200 || res.status === 409) return;
+      if (res.status === 200 || res.status === 409) {
+        if (res.status === 409) note('register answered 409: another entry registered first; idling like the rest');
+        return;
+      }
       if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
       if (attempt > 0 && attempt % 20 === 0) {
-        process.stderr.write(`[entry] register retry attempt ${attempt}: ${err instanceof Error ? err.message : String(err)}\n`);
+        note(`register retry attempt ${attempt}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     await sleep(retryDelay(attempt));
   }
 }
 
-/** Poll GET /done until it answers {"done":true}; never return before that. */
+/**
+ * Poll GET /done until it answers {"done":true}; never return before that. Failed polls are counted so
+ * a long trial leaves a trace of how often the env was unreachable.
+ */
 async function waitForDone(): Promise<void> {
+  let failures = 0;
   for (let attempt = 0; ; attempt += 1) {
     try {
       const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (res.ok) {
         const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
+        if (body.done === true) {
+          if (failures > 0) note(`done poll: ${failures} failed poll(s) before the env answered`);
+          return;
+        }
+      } else {
+        failures += 1;
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      failures += 1; // The env is not answering yet, or the poll timed out: it is not done, so poll again.
     }
     await sleep(retryDelay(attempt));
   }
+}
+
+/** Close the listening socket, bounded by CLOSE_GRACE_MS so a stuck keep-alive cannot hang exit. */
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      note(`server.close() exceeded ${CLOSE_GRACE_MS}ms; destroying open connections`);
+      server.closeAllConnections();
+      resolve();
+    }, CLOSE_GRACE_MS);
+    server.close(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
@@ -89,20 +124,29 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  note(`listening on port ${address.port}`);
+
+  // Die cleanly if the env vanishes mid-trial: a SIGTERM/SIGINT should still exit, not leave a zombie
+  // holding the ephemeral port open for the harness to reap on timeout.
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.once(signal, () => {
+      note(`received ${signal}; closing and exiting`);
+      void closeServer(server).then(() => process.exit(0));
+    });
+  }
 
   await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
+  note('registered; waiting for the env to say done');
 
   await waitForDone();
-  server.close();
-  process.stdout.write('[entry] done\n');
+  await closeServer(server);
+  note('done');
 }
 
 try {
   await main();
   process.exit(0);
 } catch (err) {
-  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
+  note(err instanceof Error ? err.message : String(err));
   process.exit(1);
 }
