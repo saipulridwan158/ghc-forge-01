@@ -15,6 +15,7 @@
 //      reads.
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// Authored revision: registry poll state surfaced on stderr for diagnosability (attempt counter log).
 
 import { createApp } from './app.ts';
 
@@ -55,6 +56,9 @@ async function register(port: number): Promise<void> {
       if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+      if (attempt > 0 && attempt % 20 === 0) {
+        process.stderr.write(`[entry] register retry attempt ${attempt}: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
     }
     await sleep(retryDelay(attempt));
   }
