@@ -54,6 +54,8 @@ export interface ForgePull {
 export interface ForgeBranch { name: string; sha: string }
 
 export interface ForgeRepo {
+  /** Bumped on every issue/comment mutation; keys response caches. */
+  issueRev?: number;
   id: number;
   owner: string;
   name: string;
@@ -301,6 +303,7 @@ export class Forge {
     const comment: ForgeComment = { id: this.nextCommentId++, body, user: this.viewer, createdAt: forgeNow(), updatedAt: forgeNow() };
     issue.comments.push(comment);
     issue.updatedAt = comment.createdAt;
+    repo.issueRev = (repo.issueRev ?? 0) + 1;
     return comment;
   }
 

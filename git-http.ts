@@ -46,6 +46,30 @@ function pktDataText(lines: Array<{ kind: 'flush' | 'delim' | 'data'; data?: Buf
   return lines.filter((l) => l.kind === 'data').map((l) => (l.data as Buffer).toString('utf8').replace(/\n$/, ''));
 }
 
+// ---- response cache: identical git requests against unchanged refs return identical bytes ----
+
+/**
+ * A repo's ref signature: the exact bytes every advertisement/fetch result derives from. Objects in
+ * the store are immutable once hashed, so the reachable set from a ref snapshot never changes.
+ */
+function refsSig(repo: ForgeRepo): string {
+  let sig = '';
+  for (const [full, sha] of repo.refs) sig += `${full}=${sha};`;
+  return sig;
+}
+
+const gitResponseCache = new Map<string, Buffer>();
+
+function cachedGit(key: string): Buffer | undefined {
+  return gitResponseCache.get(key);
+}
+
+function rememberGit(key: string, value: Buffer): Buffer {
+  if (gitResponseCache.size > 512) gitResponseCache.clear();
+  gitResponseCache.set(key, value);
+  return value;
+}
+
 // ---- ref advertisement ----
 
 interface AdvertisedRef { oid: string; name: string; peeled?: string }
@@ -234,9 +258,19 @@ function reachableObjectsShallow(forge: Forge, tips: readonly string[], haveTips
 }
 
 
-/** True when ancestorSha is reachable from descendantSha (or equal). */
+/** True when ancestorSha is reachable from descendantSha (or equal). Early exit at the first hit. */
 function isAncestor(forge: Forge, ancestorSha: string, descendantSha: string): boolean {
-  return ancestry(forge, descendantSha).has(ancestorSha);
+  if (ancestorSha === descendantSha) return true;
+  const seen = new Set<string>();
+  const queue = [descendantSha];
+  while (queue.length > 0) {
+    const sha = queue.pop() as string;
+    if (sha === ancestorSha) return true;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    for (const parent of parentsOf(forge, sha)) if (!seen.has(parent)) queue.push(parent);
+  }
+  return false;
 }
 
 
@@ -255,18 +289,30 @@ function collectTreeClosure(forge: Forge, treeSha: string, out: Set<string>): vo
 
 // ---- commit ancestry ----
 
+/** Memoized commit->parents (commits are immutable once hashed). */
+const parentsMemo = new WeakMap<Forge, Map<string, string[]>>();
+function parentsOf(forge: Forge, sha: string): string[] {
+  let memo = parentsMemo.get(forge);
+  if (memo === undefined) { memo = new Map(); parentsMemo.set(forge, memo); }
+  let parents = memo.get(sha);
+  if (parents === undefined) {
+    const obj = forge.store.get(sha);
+    parents = obj !== undefined && obj.type === 'commit' ? parseCommit(obj.data).parents : [];
+    memo.set(sha, parents);
+  }
+  return parents;
+}
+
 function ancestry(forge: Forge, tipSha: string): Set<string> {
   const out = new Set<string>();
   const queue = [tipSha];
   while (queue.length > 0) {
-    const sha = queue.shift() as string;
+    const sha = queue.pop() as string;
     if (out.has(sha)) continue;
     const obj = forge.store.get(sha);
     if (obj === undefined) continue;
     out.add(sha);
-    if (obj.type === 'commit') {
-      for (const parent of parseCommit(obj.data).parents) queue.push(parent);
-    }
+    for (const parent of parentsOf(forge, sha)) queue.push(parent);
   }
   return out;
 }
@@ -330,10 +376,12 @@ interface FetchRequest {
   depth: number | null;
   shallow: string[];
   done: boolean;
+  /** Cache key fragment: the haves that actually constrain reachability. */
+  effectiveHavesKey: string;
 }
 
 function parseFetchRequest(lines: readonly string[]): FetchRequest {
-  const req: FetchRequest = { wants: [], haves: [], depth: null, shallow: [], done: false };
+  const req: FetchRequest = { wants: [], haves: [], depth: null, shallow: [], done: false, effectiveHavesKey: '' };
   for (const line of lines) {
     if (line.startsWith('want ')) req.wants.push(line.slice(5).split(' ')[0]);
     else if (line.startsWith('have ')) req.haves.push(line.slice(5));
@@ -341,11 +389,15 @@ function parseFetchRequest(lines: readonly string[]): FetchRequest {
     else if (line.startsWith('deepen ')) req.depth = Number.parseInt(line.slice(7), 10);
     else if (line === 'done') req.done = true;
   }
+  req.effectiveHavesKey = req.haves.filter((sha) => !req.shallow.includes(sha)).sort().join(',');
   return req;
 }
 
 function handleV2Fetch(forge: Forge, repo: ForgeRepo, requestLines: readonly string[], respond: (chunk: Buffer) => void): void {
   const req = parseFetchRequest(requestLines);
+  const cacheKey = `fetch2-${repo.id}-${refsSig(repo)}-${req.wants.join(',')}|${req.effectiveHavesKey}|d=${req.depth}|sh=${req.shallow.join(',')}`;
+  const hit = cachedGit(cacheKey);
+  if (hit !== undefined) { respond(hit); return; }
   // acknowledgments section
   const chunks: Buffer[] = [];
   chunks.push(pktLine('acknowledgments\n'));
@@ -379,7 +431,8 @@ function handleV2Fetch(forge: Forge, repo: ForgeRepo, requestLines: readonly str
   void repo;
   sendSideBand(chunks, pack);
   chunks.push(flushPkt());
-  respond(Buffer.concat(chunks));
+  rememberGit(cacheKey, Buffer.concat(chunks));
+  respond(cachedGit(cacheKey) as Buffer);
 }
 
 /** Send a pack through side-band-64k pkt-lines (band 1). */
@@ -548,7 +601,6 @@ function handleReceivePack(forge: Forge, repo: ForgeRepo, body: Buffer, respond:
     }
   }
   // apply the pack: parse and store all objects
-  process.stderr.write(`[rp] cmds=${JSON.stringify(commands)} packs=${pendingPacks.map(b=>b.length)} sideband=${sideband}\n`);
   const storedShas = new Set<string>();
   for (const packBuf of pendingPacks) {
     try {
@@ -644,29 +696,43 @@ export function handleGit(ctx: GitCtx): void {
 
   if (action === 'info/refs' && ctx.method === 'GET') {
     const service = ctx.query.get('service') ?? '';
+    const sig = refsSig(repo);
     if (service === 'git-upload-pack') {
       const proto = String(ctx.headers['git-protocol'] ?? ctx.query.get('Git-Protocol') ?? '');
-      if (proto.includes('version=2')) {
-        ctx.raw(200, 'application/x-git-upload-pack-advertisement', Buffer.concat([
+      const v2 = proto.includes('version=2');
+      const cacheKey = `refs-up-${repo.id}-${v2 ? 2 : 0}-${sig}`;
+      const hit = cachedGit(cacheKey);
+      if (hit !== undefined) {
+        ctx.raw(200, 'application/x-git-upload-pack-advertisement', hit);
+        return;
+      }
+      if (v2) {
+        rememberGit(cacheKey, Buffer.concat([
           pktLine('# service=git-upload-pack\n'),
           flushPkt(),
           v2CapabilityAdvertisement(repo),
         ]));
-        return;
+      } else {
+        rememberGit(cacheKey, Buffer.concat([
+          pktLine('# service=git-upload-pack\n'),
+          flushPkt(),
+          v0UploadAdvertisement(repo),
+        ]));
       }
-      ctx.raw(200, 'application/x-git-upload-pack-advertisement', Buffer.concat([
-        pktLine('# service=git-upload-pack\n'),
-        flushPkt(),
-        v0UploadAdvertisement(repo),
-      ]));
+      ctx.raw(200, 'application/x-git-upload-pack-advertisement', (cachedGit(cacheKey) as Buffer));
       return;
     }
     if (service === 'git-receive-pack') {
-      ctx.raw(200, 'application/x-git-receive-pack-advertisement', Buffer.concat([
-        pktLine('# service=git-receive-pack\n'),
-        flushPkt(),
-        v0ReceiveAdvertisement(repo),
-      ]));
+      const cacheKey = `refs-rp-${repo.id}-${sig}`;
+      let body = cachedGit(cacheKey);
+      if (body === undefined) {
+        body = rememberGit(cacheKey, Buffer.concat([
+          pktLine('# service=git-receive-pack\n'),
+          flushPkt(),
+          v0ReceiveAdvertisement(repo),
+        ]));
+      }
+      ctx.raw(200, 'application/x-git-receive-pack-advertisement', body);
       return;
     }
     // dumb protocol: not supported

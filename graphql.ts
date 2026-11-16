@@ -321,6 +321,7 @@ export async function handleGraphQL(ctx: GraphQLCtx): Promise<void> {
     found.issue.state = 'closed';
     found.issue.closedAt = new Date().toISOString();
     found.issue.updatedAt = found.issue.closedAt;
+    found.repo.issueRev = (found.repo.issueRev ?? 0) + 1;
     gqlResponse(ctx, 200, { closeIssue: { issue: issueObject(found.issue, found.repo) } });
     return;
   }

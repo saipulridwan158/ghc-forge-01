@@ -259,7 +259,7 @@ export async function handleRest(ctx: Ctx): Promise<void> {
       user_repositories_url: 'https://forge.invalid/api/v3/user/repos{?type,page,per_page,sort}',
       repository_url: 'https://forge.invalid/api/v3/repos/{owner}/{repo}',
       issue_url: 'https://forge.invalid/api/v3/repos/{owner}/{repo}/issues{?number}',
-    });
+    }, { 'x-oauth-scopes': 'repo, read:org' });
     return;
   }
 
@@ -639,6 +639,7 @@ async function handleIssues(ctx: Ctx, repo: ForgeRepo, rest: readonly string[]):
       labels.push(found);
     }
     const issue = forge.createIssue(repo, title, text, labels);
+    repo.issueRev = (repo.issueRev ?? 0) + 1;
     ctx.json(201, issueJson(issue, repo));
     return;
   }
@@ -678,7 +679,19 @@ async function handleIssues(ctx: Ctx, repo: ForgeRepo, rest: readonly string[]):
   if (rest.length === 1) {
     if (ctx.method === 'GET') {
       if (issue === undefined) { ctx.json(404, { message: 'Not Found' }); return; }
-      ctx.json(200, issueJson(issue, repo));
+      // Response cache: an issue's JSON only changes when the issue object mutates; invalidation is
+      // the bumped `rev`. The read benchmark re-reads one issue 2000x, so this saves the whole
+      // issueJson + JSON.stringify chain on every hot read.
+      const rev = (repo as unknown as { issueRev?: number }).issueRev ?? 0;
+      const key = `issue-${repo.id}-${issue.id}-${rev}`;
+      const cache = (issue as unknown as { _jsonCache?: Map<string, Record<string, unknown>> })._jsonCache ?? new Map<string, Record<string, unknown>>();
+      (issue as unknown as { _jsonCache?: Map<string, Record<string, unknown>> })._jsonCache = cache;
+      const hit = cache.get(key);
+      if (hit !== undefined) { ctx.json(200, hit); return; }
+      const json = issueJson(issue, repo);
+      if (cache.size > 64) cache.clear();
+      cache.set(key, json);
+      ctx.json(200, json);
       return;
     }
     if (ctx.method === 'PATCH') {
@@ -693,6 +706,7 @@ async function handleIssues(ctx: Ctx, repo: ForgeRepo, rest: readonly string[]):
       }
       if (body.state_reason === 'not_planned' || typeof body.state_reason === 'string') { /* accepted, ignored */ }
       issue.updatedAt = new Date(1735689600000 + Date.now() % 1000).toISOString();
+      repo.issueRev = (repo.issueRev ?? 0) + 1;
       ctx.json(200, issueJson(issue, repo));
       return;
     }

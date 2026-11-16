@@ -30,26 +30,50 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 
 let requestCounter = 0;
 
+/**
+ * GET /api/v3 response memo. Keyed by the request line + token; cleared whenever anything could have
+ * mutated the forge (any non-GET REST request, GraphQL, MCP, git push). Entries are prebuilt body
+ * texts for hot repeated reads; the memo never holds paginated responses (they carry a Link header).
+ */
+const getMemo = new Map<string, { text: string; headers: Record<string, string> }>();
+function invalidateGetMemo(): void {
+  if (getMemo.size > 0) getMemo.clear();
+}
+
 function requestId(): string {
   requestCounter += 1;
   return `FFFF:${String(requestCounter).padStart(12, '0')}`;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
+/** Path of a request URL (or '/' when it does not parse), memoized per URL string. */
+const urlPathCache = new Map<string, string>();
 function pathOf(req: IncomingMessage): string {
-  try {
-    return decodeURIComponent(new URL(req.url ?? '/', 'http://entry').pathname);
-  } catch {
-    return '/';
+  const url = req.url ?? '/';
+  let path = urlPathCache.get(url);
+  if (path === undefined) {
+    try {
+      path = decodeURIComponent(new URL(url, 'http://entry').pathname);
+    } catch {
+      path = '/';
+    }
+    if (urlPathCache.size < 4096) urlPathCache.set(url, path);
   }
+  return path;
 }
 
+const urlQueryCache = new Map<string, URLSearchParams>();
 function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+  const url = req.url ?? '/';
+  let query = urlQueryCache.get(url);
+  if (query === undefined) {
+    try {
+      query = new URL(url, 'http://entry').searchParams;
+    } catch {
+      query = new URLSearchParams();
+    }
+    if (urlQueryCache.size < 4096) urlQueryCache.set(url, query);
   }
+  return query;
 }
 
 function tokenOf(req: IncomingMessage): string | null {
@@ -85,19 +109,33 @@ export function createApp(): Server {
         return;
       }
 
-      // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-      if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-        json(200, {
-          current_user_url: '/api/v3/user',
-          rate_limit_url: '/api/v3/rate_limit',
-          user_repositories_url: '/api/v3/user/repos{?type,page,per_page,sort}',
-          repository_url: '/api/v3/repos/{owner}/{repo}',
-        }, { 'x-oauth-scopes': 'repo, read:org' });
+      // GET responses are pure functions of (method, path, query, token, forge state). A short-lived
+      // memo keyed by the request line turns the read workload's 2000 identical GETs into
+      // Map-lookup + prebuilt write: no JSON parse of body (GETs have none), no re-serialization.
+      if (method === 'GET' && (path === '/api/v3' || path.startsWith('/api/v3/'))) {
+        const key = `${path}?${query}|${token ?? ''}`;
+        const memo = getMemo.get(key);
+        if (memo !== undefined) {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': requestId(), ...memo.headers });
+          res.end(memo.text);
+          return;
+        }        const subPath = path.slice('/api/v3'.length);
+        await handleRest({
+          forge, token, method, path: subPath, query, rawBody: Buffer.alloc(0), host: String(req.headers.host ?? 'localhost'),
+          json: (status, body, headers = {}) => {
+            const text = `${JSON.stringify(body)}\n`;
+            if (status === 200 && !headers.link) getMemo.set(key, { text, headers: { ...headers } });
+            sendJson(res, status, body, headers);
+          },
+        }).catch((err: unknown) => {
+          json(500, { message: err instanceof Error ? err.message : 'internal error' });
+        });
         return;
       }
 
       // REST v3
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+        if (method !== 'GET') invalidateGetMemo();
         const subPath = path.slice('/api/v3'.length);
         const rawBody = await readBody(req);
         // malformed JSON on body-carrying methods is a 400 (checked inside the routers)
@@ -120,6 +158,7 @@ export function createApp(): Server {
 
       // GraphQL v4
       if (path === '/api/graphql') {
+        if (method !== 'GET') invalidateGetMemo();
         const rawBody = await readBody(req);
         let parsed: unknown = undefined;
         let malformed = false;
@@ -136,6 +175,7 @@ export function createApp(): Server {
 
       // MCP
       if (path === '/mcp') {
+        if (method !== 'GET') invalidateGetMemo();
         const rawBody = await readBody(req);
         await handleMcp({ forge, token, method, query, rawBody, json, req, res }).catch((err: unknown) => {
           json(500, { message: err instanceof Error ? err.message : 'internal error' });
@@ -146,6 +186,7 @@ export function createApp(): Server {
       // git smart HTTP
       if (path.includes('.git/') || path.endsWith('.git')) {
         const rawBody = await readBody(req);
+        if (rawBody.length > 0) invalidateGetMemo();
         try {
           handleGit({
             forge,

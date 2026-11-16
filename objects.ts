@@ -203,7 +203,11 @@ export interface CommitInfo {
   message: string;
 }
 
+const commitCache = new WeakMap<Buffer, CommitInfo>();
+
 export function parseCommit(data: Buffer): CommitInfo {
+  const hit = commitCache.get(data);
+  if (hit !== undefined) return hit;
   const text = data.toString('utf8');
   const info: CommitInfo = { tree: '', parents: [], author: { name: '', email: '', epochSec: 0 }, committer: { name: '', email: '', epochSec: 0 }, message: '' };
   const lines = text.split('\n');
@@ -220,6 +224,7 @@ export function parseCommit(data: Buffer): CommitInfo {
     else if (key === 'committer') info.committer = parseIdent(value);
   }
   info.message = lines.slice(i).join('\n').replace(/\n$/, '');
+  commitCache.set(data, info);
   return info;
 }
 
@@ -248,7 +253,11 @@ export function buildCommit(info: Omit<CommitInfo, 'committer'> & { committer?: 
 
 export interface TreeEntry { mode: string; name: string; sha: string }
 
+const treeCache = new WeakMap<Buffer, TreeEntry[]>();
+
 export function parseTree(data: Buffer): TreeEntry[] {
+  const hit = treeCache.get(data);
+  if (hit !== undefined) return hit;
   const entries: TreeEntry[] = [];
   let p = 0;
   while (p < data.length) {
@@ -262,6 +271,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
     p = nul + 21;
     entries.push({ mode, name, sha });
   }
+  treeCache.set(data, entries);
   return entries;
 }
 
