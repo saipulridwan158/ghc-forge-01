@@ -92,7 +92,8 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    req.socket.setNoDelay(true);
     void (async (): Promise<void> => {
       const path = pathOf(req);
       const method = req.method ?? 'GET';
@@ -214,4 +215,5 @@ export function createApp(): Server {
       else res.end();
     });
   });
+  return server;
 }
